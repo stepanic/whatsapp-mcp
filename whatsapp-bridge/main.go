@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -191,8 +192,9 @@ func extractTextContent(msg *waProto.Message) string {
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -200,12 +202,31 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// Citiranje: ID poruke na koju se odgovara. Posiljatelj se po potrebi
+	// izvuce iz messages.db, a ako ga nema uzima se vlasnik ove sesije.
+	QuotedMessageID string `json:"quoted_message_id,omitempty"`
+	QuotedSender    string `json:"quoted_sender,omitempty"`
+}
+
+// mediaTypeFromPath vraca kategoriju medija iz ekstenzije, za upis poslane
+// poruke u messages.db (ista podjela kao switch u sendWhatsAppMessage).
+func mediaTypeFromPath(path string) string {
+	switch strings.ToLower(strings.TrimPrefix(filepath.Ext(path), ".")) {
+	case "jpg", "jpeg", "png", "gif", "webp":
+		return "image"
+	case "ogg", "mp3", "m4a", "wav", "aac":
+		return "audio"
+	case "mp4", "avi", "mov":
+		return "video"
+	default:
+		return "document"
+	}
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedID string, quotedSender string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	// Create JID for recipient
@@ -219,7 +240,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
 		// Create JID from phone number
@@ -236,7 +257,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -285,7 +306,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +336,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -361,14 +382,80 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		msg.Conversation = proto.String(message)
 	}
 
-	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
-
-	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+	// Citiranje poruke (reply). WhatsApp trazi ContextInfo sa StanzaID i
+	// posiljateljem citirane poruke; tekst citata se vuce iz lokalne baze
+	// da se u klijentu prikaze sadrzaj, a ne prazan okvir.
+	if quotedID != "" {
+		participant := quotedSender
+		if participant == "" && client.Store.ID != nil {
+			participant = client.Store.ID.ToNonAD().String()
+		}
+		quotedText := ""
+		if messageStore != nil {
+			_ = messageStore.db.QueryRow(
+				"SELECT content FROM messages WHERE id = ?", quotedID,
+			).Scan(&quotedText)
+		}
+		if quotedText == "" {
+			quotedText = " "
+		}
+		ctxInfo := &waProto.ContextInfo{
+			StanzaID:      proto.String(quotedID),
+			Participant:   proto.String(participant),
+			QuotedMessage: &waProto.Message{Conversation: proto.String(quotedText)},
+		}
+		switch {
+		case msg.ImageMessage != nil:
+			msg.ImageMessage.ContextInfo = ctxInfo
+		case msg.AudioMessage != nil:
+			msg.AudioMessage.ContextInfo = ctxInfo
+		case msg.VideoMessage != nil:
+			msg.VideoMessage.ContextInfo = ctxInfo
+		case msg.DocumentMessage != nil:
+			msg.DocumentMessage.ContextInfo = ctxInfo
+		default:
+			// Obican tekst s citatom mora ici kao ExtendedTextMessage.
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: ctxInfo,
+			}
+			msg.Conversation = nil
+		}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	// Send message
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
+
+	if err != nil {
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
+	}
+
+	// Upisi vlastitu poslanu poruku u povijest. whatsmeow ne vraca event za
+	// poruke poslane s ovog uredjaja, pa bi bez ovoga izlazna strana niti
+	// nedostajala u messages.db (bitno za dvosmjerni CRM).
+	chatJID := recipientJID.String()
+	if messageStore != nil {
+		mediaType := ""
+		filename := ""
+		if mediaPath != "" {
+			mediaType = mediaTypeFromPath(mediaPath)
+			filename = filepath.Base(mediaPath)
+		}
+		content := message
+		if content == "" && mediaType != "" {
+			content = fmt.Sprintf("[%s: %s]", mediaType, filename)
+		}
+		if err := messageStore.StoreMessage(
+			resp.ID, chatJID, client.Store.ID.User, content, resp.Timestamp, true,
+			mediaType, filename, "", nil, nil, nil, 0,
+		); err != nil {
+			fmt.Printf("Upozorenje: poslana poruka nije upisana u bazu: %v\n", err)
+		} else {
+			messageStore.StoreChat(chatJID, "", resp.Timestamp)
+		}
+	}
+
+	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
 }
 
 // Extract media info from a message
@@ -507,6 +594,15 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
 }
 
+// mediaBaseDir vraca korijen za skinute medijske datoteke.
+// WA_MEDIA_DIR ih seli izvan repoa (npr. na vanjski disk); default je store/.
+func mediaBaseDir() string {
+	if dir := os.Getenv("WA_MEDIA_DIR"); dir != "" {
+		return dir
+	}
+	return "store"
+}
+
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
 type MediaDownloader struct {
 	URL           string
@@ -562,7 +658,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join(mediaBaseDir(), strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -641,7 +737,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -655,24 +751,22 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
-// Extract direct path from a WhatsApp media URL
-func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
-	parts := strings.SplitN(url, ".net/", 2)
-	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+// Extract direct path from a WhatsApp media URL.
+//
+// VAZNO: query string (?ccb=..&oh=..&oe=..) se MORA zadrzati. whatsmeow u
+// DownloadMediaWithPath gradi URL kao "https://<host>" + directPath + "&hash=..",
+// dakle pretpostavlja da directPath vec ima "?". Ako se query odbaci, sve zavrsi
+// u putanji i CDN vrati HTTP 403.
+func extractDirectPathFromURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Path == "" {
+		return rawURL
 	}
-
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	directPath := parsed.Path
+	if parsed.RawQuery != "" {
+		directPath += "?" + parsed.RawQuery
+	}
+	return directPath
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -706,7 +800,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.QuotedMessageID, req.QuotedSender)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -718,8 +812,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: sentID,
 		})
 	})
 
@@ -775,13 +870,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+			// Ne nastavljaj bez REST-a: proces bi ostao spojen na WhatsApp kao
+			// drugi klijent na istoj sesiji (port zauzet = bridge vec radi).
 			fmt.Printf("REST API server error: %v\n", err)
+			os.Exit(1)
 		}
 	}()
 }
@@ -800,14 +898,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -866,9 +964,28 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
+		// Dva nacina uparivanja:
+		//   WA_PAIR_PHONE=385989679022  -> osmeroznamenkasti kod (Link with phone number)
+		//   bez te varijable             -> QR kod u terminalu
+		// Oba idu kroz isti qrChan; PairPhone se smije zvati tek nakon prvog "code" eventa.
+		pairCodeShown := false
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				if pairPhone := os.Getenv("WA_PAIR_PHONE"); pairPhone != "" {
+					if pairCodeShown {
+						continue
+					}
+					code, err := client.PairPhone(context.Background(), pairPhone, true,
+						whatsmeow.PairClientChrome, "Chrome (Mac OS)")
+					if err != nil {
+						logger.Errorf("Neuspjelo generiranje koda za uparivanje: %v", err)
+						return
+					}
+					fmt.Printf("\nNa iPhoneu: WhatsApp -> Settings -> Linked Devices -> Link a Device\n"+
+						"-> Link with phone number instead\n\nKod: %s\n\n", code)
+					pairCodeShown = true
+					continue
+				}
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
@@ -973,7 +1090,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1105,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
