@@ -173,8 +173,43 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// unwrapMessage skida omotace u kojima WhatsApp isporucuje pravu poruku.
+//
+// ViewOnce, ephemeral (nestajuce poruke) i DocumentWithCaption ne nose sadrzaj
+// sami — unutra je jos jedan `Message`. Za zive dogadaje whatsmeow to vec
+// odmota, ali poruke iz history synca stizu sirove, pa bi se bez ovoga slika s
+// captionom u nestajucem chatu upisala kao prazna.
+func unwrapMessage(msg *waProto.Message) *waProto.Message {
+	// Omotac u omotacu postoji (ephemeral + viewOnce), ali lanac je kratak;
+	// granica je tu da pokvaren payload ne vrti petlju u nedogled.
+	for i := 0; i < 4 && msg != nil; i++ {
+		switch {
+		case msg.GetEphemeralMessage().GetMessage() != nil:
+			msg = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage().GetMessage() != nil:
+			msg = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetViewOnceMessageV2Extension().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2Extension().GetMessage()
+		case msg.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			msg = msg.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			return msg
+		}
+	}
+	return msg
+}
+
 // Extract text content from a message
+//
+// Caption uz sliku/video/dokument je ravnopravan tekst, ne ukras: kad netko
+// posalje screenshot i uz njega napise sto s tim treba, caption JE poruka.
+// Dok se citalo samo Conversation i ExtendedTextMessage, takva je poruka u bazi
+// zavrsavala s praznim `content` — sto izvana izgleda identicno slici bez
+// ijedne rijeci. Audio nema caption u protokolu, zato ga ovdje nema.
 func extractTextContent(msg *waProto.Message) string {
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return ""
 	}
@@ -186,7 +221,17 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
 	return ""
 }
 
@@ -460,6 +505,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+	// Isti omotaci kao u extractTextContent — dokument poslan s captionom stize
+	// kao DocumentWithCaptionMessage, pa bi se bez odmotavanja upisao kao poruka
+	// bez privitka.
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
@@ -1171,14 +1220,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Isti put kao za zive poruke — inace se caption gubi samo na
+				// onome sto dode kroz history sync, sto je tesko primijetiti.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
