@@ -296,6 +296,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	msg := &waProto.Message{}
+	previewNote := ""
 
 	// Check if we have media to send
 	if mediaPath != "" {
@@ -424,7 +425,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			}
 		}
 	} else {
-		msg.Conversation = proto.String(message)
+		// Link preview: WhatsApp ga ugradjuje na strani posiljatelja, pa poruka
+		// s URL-om mora ici kao ExtendedTextMessage s og: podacima. Bez ovoga
+		// primatelj vidi gol link (vidi linkpreview.go).
+		if ext := buildLinkPreview(client, message); ext != nil {
+			msg.ExtendedTextMessage = ext
+			previewNote = previewSummary(ext)
+		} else {
+			msg.Conversation = proto.String(message)
+		}
 	}
 
 	// Citiranje poruke (reply). WhatsApp trazi ContextInfo sa StanzaID i
@@ -458,6 +467,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			msg.VideoMessage.ContextInfo = ctxInfo
 		case msg.DocumentMessage != nil:
 			msg.DocumentMessage.ContextInfo = ctxInfo
+		case msg.ExtendedTextMessage != nil:
+			// Tekst s preview-om je vec ExtendedTextMessage — citat mu se samo
+			// dopise, inace bi se preview izgubio.
+			msg.ExtendedTextMessage.ContextInfo = ctxInfo
 		default:
 			// Obican tekst s citatom mora ici kao ExtendedTextMessage.
 			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
@@ -500,7 +513,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
+	return true, fmt.Sprintf("Message sent to %s%s", recipient, previewNote), resp.ID
 }
 
 // Extract media info from a message
