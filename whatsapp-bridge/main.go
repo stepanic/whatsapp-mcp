@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -346,7 +347,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			// Pravi MIME je nuzan: s octet-streamom klijent ne zna da je PDF i
+			// ne nudi preview ni otvaranje unutar WhatsAppa.
+			mimeType = mime.TypeByExtension("." + fileExt)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Upload media to WhatsApp servers
@@ -412,8 +418,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			// FileName je ono sto klijent prikazuje; samo Title daje "Untitled".
+			fileName := filepath.Base(mediaPath)
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(fileName),
+				FileName:      proto.String(fileName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -422,6 +431,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+			}
+			if mimeType == "application/pdf" {
+				addPDFPreview(msg.DocumentMessage, mediaPath)
 			}
 		}
 	} else {
