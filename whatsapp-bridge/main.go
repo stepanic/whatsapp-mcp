@@ -880,6 +880,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for listing joined groups (vidi groups.go)
+	http.HandleFunc("/api/groups", handleGroups(client))
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
