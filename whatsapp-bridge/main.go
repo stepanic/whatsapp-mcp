@@ -102,11 +102,45 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	// Prazno ime nikad ne brise postojece — INSERT OR REPLACE je to radio pa su
+	// chatovi kojima smo slali poruke ostajali bez imena i list_chats ih nije nalazio.
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = COALESCE(NULLIF(excluded.name, ''), chats.name),
+			last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
 	return err
+}
+
+// Chatovi bez imena (posljedica starog INSERT OR REPLACE) dobiju ime iz
+// kontakata ili group infoa.
+func backfillChatNames(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	rows, err := messageStore.db.Query("SELECT jid FROM chats WHERE name IS NULL OR name = ''")
+	if err != nil {
+		logger.Warnf("Backfill imena chatova: %v", err)
+		return
+	}
+	var jids []string
+	for rows.Next() {
+		var j string
+		if rows.Scan(&j) == nil {
+			jids = append(jids, j)
+		}
+	}
+	rows.Close()
+	for _, j := range jids {
+		jid, err := types.ParseJID(j)
+		if err != nil {
+			continue
+		}
+		name := GetChatName(client, messageStore, jid, j, nil, "", logger)
+		messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, j)
+	}
+	if len(jids) > 0 {
+		logger.Infof("Backfill imena chatova: %d", len(jids))
+	}
 }
 
 // Store a message in the database
@@ -521,7 +555,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		); err != nil {
 			fmt.Printf("Upozorenje: poslana poruka nije upisana u bazu: %v\n", err)
 		} else {
-			messageStore.StoreChat(chatJID, "", resp.Timestamp)
+			messageStore.StoreChat(chatJID, GetChatName(client, messageStore, recipientJID, chatJID, nil, "", waLog.Noop), resp.Timestamp)
 		}
 	}
 
@@ -1096,6 +1130,8 @@ func main() {
 		logger.Errorf("Failed to establish stable connection")
 		return
 	}
+
+	go backfillChatNames(client, messageStore, logger)
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
